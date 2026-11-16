@@ -137,9 +137,9 @@ def extract_tool_calls(llm_output: str) -> List[Dict[str, Any]]:
             "content": unwrap_inner_code_fence(m.group(2)),
         }))
 
-    # 3. <rykr_cmd>...</rykr_cmd>
+    # 3. <rykr_cmd>...</rykr_cmd> (also tolerates 3B ```rykr_cmd> ... ``` fence quirk)
     for m in re.finditer(
-        r"^[ \t]*<rykr_cmd>\n?([\s\S]*?)\n?[ \t]*</rykr_cmd>",
+        r"^[ \t]*(?:<rykr_cmd>|```rykr_cmd>?)\n?([\s\S]*?)\n?[ \t]*(?:</rykr_cmd>|```)",
         llm_output,
         re.MULTILINE,
     ):
@@ -202,8 +202,10 @@ def execute_single_call(
             with open(target, "r", encoding="utf-8", errors="replace") as f:
                 lines = f.readlines()
             s = max(1, call.get("start", 1))
-            e = min(len(lines), call.get("end", 250))
+            e = min(len(lines), call.get("end", 80))
             snippet = "".join(f"{i}: {lines[i - 1]}" for i in range(s, e + 1))
+            if len(snippet) > 2000:
+                snippet = snippet[:2000] + "\n...[TRUNCATED AT 2000 CHARS FOR LOCAL APU CONTEXT]..."
             return {"tool": "read", "status": "SUCCESS", "path": str(target), "lines": f"{s}-{e}", "output": snippet}
         except Exception as exc:
             return {"tool": "read", "status": "ERROR", "path": str(target), "output": str(exc)}
@@ -281,8 +283,8 @@ def execute_single_call(
                 timeout=timeout,
             )
             combined = (res.stdout + ("\n" + res.stderr if res.stderr else "")).strip()
-            if len(combined) > 8000:
-                combined = combined[:8000] + "\n...[TRUNCATED AT 8000 CHARS]..."
+            if len(combined) > 2000:
+                combined = combined[:2000] + "\n...[TRUNCATED AT 2000 CHARS FOR LOCAL APU CONTEXT]..."
             return {
                 "tool": "cmd",
                 "status": "SUCCESS" if res.returncode == 0 else "NON_ZERO_EXIT",

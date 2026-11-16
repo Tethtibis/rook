@@ -233,6 +233,7 @@ class RookEngineManager:
                     stderr=subprocess.STDOUT,
                     env=env,
                     preexec_fn=_bind_parent_death_signal if bind_pdeath else None,
+                    start_new_session=(not bind_pdeath),
                     close_fds=True,
                 )
                 self._spawn_res_q.put((proc, None))

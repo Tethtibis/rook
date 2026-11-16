@@ -220,6 +220,17 @@ def _dedup_repetitions(text: str) -> str:
     return out
 
 
+def _close_truncated_xml_tag(text: str) -> str:
+    """If generation halted on a stop sequence right at a closing XML tool tag, restore the closing tag."""
+    if "<rykr_cmd>" in text and "</rykr_cmd>" not in text:
+        return text.rstrip() + "\n</rykr_cmd>"
+    if "<rykr_write " in text and "</rykr_write>" not in text:
+        return text.rstrip() + "\n</rykr_write>"
+    if "<rykr_read " in text and "/>" not in text.split("<rykr_read ")[-1] and "</rykr_read>" not in text:
+        return text.rstrip() + "/>"
+    return text
+
+
 def call_openai_compat(
     system_instruction: str,
     messages: List[Dict[str, str]],
@@ -238,10 +249,18 @@ def call_openai_compat(
         "messages": oai_msgs,
         "temperature": 0.3,
         "top_p": 0.9,
-        "repeat_penalty": 1.15,
+        "repeat_penalty": 1.18,
         "frequency_penalty": 0.25,
         "presence_penalty": 0.15,
-        "max_tokens": 1024,
+        "max_tokens": 450,
+        "stop": [
+            "</rykr_cmd>",
+            "</rykr_write>",
+            "</rykr_read>",
+            "<TOOL_TELEMETRY>",
+            "<OPERATOR_PACKET>",
+            "<|im_end|>",
+        ],
     }
     headers = {
         "Content-Type": "application/json",
@@ -259,6 +278,7 @@ def call_openai_compat(
     if not choices:
         raise RuntimeError(f"OpenAI-compatible endpoint returned no choices: {body}")
     raw = choices[0].get("message", {}).get("content", "")
+    raw = _close_truncated_xml_tag(raw)
     return _dedup_repetitions(raw)
 
 
