@@ -16,6 +16,8 @@ Unifies the isolated Rook modules:
 import os
 import re
 import sys
+import time
+from typing import Any, Callable, Optional
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
@@ -61,8 +63,17 @@ def _compact_tool_history_tag(step_logs: list) -> str:
     return "\n[tools_executed: " + "; ".join(parts) + "]"
 
 
+def _emit(event_cb: Optional[Callable[[str, str], None]], tag: str, msg: str) -> None:
+    if event_cb is None:
+        return
+    try:
+        event_cb(tag, msg)
+    except Exception:
+        pass
+
+
 def _detect_loop_or_stall(user_input: str, assistant_text: str, prior_turns: list) -> bool:
-    """Detects when a local model stalls asking permission or repeats a prior assistant response."""
+    """Detects permission stalls, repeated replies, or unverified offline claims on network requests."""
     low_resp = assistant_text.lower()
     low_user = user_input.lower().strip()
     recent_assistant = [
@@ -80,15 +91,39 @@ def _detect_loop_or_stall(user_input: str, assistant_text: str, prior_turns: lis
         "would you like me to continue",
         "would you like me to proceed",
         "would you like me to install",
+        "would you like me to check",
+        "would you like me to test",
+        "would you like me to run",
         "shall i proceed",
+        "shall i continue",
         "do you want me to proceed",
         "do you want me to continue",
+        "let me know if you'd like me to",
+        "please confirm if you want",
     ))
     affirmative_or_action = (
         low_user in ("yes", "yes please", "yes please continue", "please do", "continue", "go ahead", "do it", "proceed")
-        or any(w in low_user for w in ("install", "change", "modify", "find", "check", "fix", "create", "update"))
+        or any(w in low_user for w in (
+            "install", "change", "modify", "find", "check", "fix", "create", "update",
+            "figure out", "why", "how", "what", "test", "try", "remember", "save",
+            "internet", "inspect", "read", "write", "run",
+        ))
     )
-    return bool(asking_perm and affirmative_or_action)
+    if asking_perm and affirmative_or_action:
+        return True
+
+    claims_offline = any(p in low_resp for p in (
+        "do not have internet",
+        "don't have internet",
+        "no internet access",
+        "cannot access the internet",
+        "can't access the internet",
+        "cannot browse",
+        "air-gapped",
+        "do not have external network",
+    ))
+    asked_net = any(w in low_user for w in ("internet", "http://", "https://", "github", "fetch", "curl", "download", "web"))
+    return bool(claims_offline and asked_net)
 
 
 def run_turn_pipeline(
@@ -98,8 +133,10 @@ def run_turn_pipeline(
     engine_override: str = None,
     vault_path: str = DEFAULT_VAULT_PATH,
     max_steps: int = MAX_TOOL_STEPS,
+    event_cb: Optional[Callable[[str, str], None]] = None,
 ) -> dict:
     """Executes one complete 5-module Rook turn (with up to `max_steps` closed-loop tool calls)."""
+    turn_started = time.monotonic()
     summary = render_snap_summary(ledger, tail_count=1)
     current_state = summary["active_genesis_state"]
     active_engine = engine_override or "rook"
@@ -109,6 +146,7 @@ def run_turn_pipeline(
 
     if directive["type"] == "HARNESS_COMMAND":
         action = directive["harness_action"]
+        _emit(event_cb, "HARNESS", f"Executing command: {action}")
         if action == "ROLLBACK":
             rb = ledger.rollback_latest(directive.get("snapshot_id"))
             return {"type": "HARNESS_COMMAND", "action": "ROLLBACK", "result": rb}
@@ -123,6 +161,7 @@ def run_turn_pipeline(
             return {"type": "HARNESS_COMMAND", "action": "CLOSE"}
 
     next_state = directive["genesis_state"]
+    _emit(event_cb, "ENGINE", f"Turn started | State={next_state} | Brain={active_engine}")
 
     # 2. Module 1: Pre-Turn Atomic Snapshot
     snapshot_meta = None
@@ -154,6 +193,7 @@ def run_turn_pipeline(
 
     # 4. Module 4 & Module 5: Closed-Loop Inference + Actuator Cycle
     while True:
+        _emit(event_cb, "ENGINE", f"Step {tool_steps_executed + 1}: waiting on LLM inference...")
         try:
             inf = dispatch_inference(
                 engine_spec=active_engine,
@@ -162,6 +202,7 @@ def run_turn_pipeline(
                 vault_path=vault_path,
             )
         except Exception as exc:
+            _emit(event_cb, "ERROR", f"Inference failed: {exc}")
             if step_logs:
                 final_response = f"[Engine interrupted after step {tool_steps_executed}: {exc}]"
                 break
@@ -177,6 +218,7 @@ def run_turn_pipeline(
             workspace_root=workspace_dir,
             seen_signatures=seen_tool_signatures,
             downshift_gate=is_local_brain,
+            event_cb=event_cb,
         )
         if not has_calls:
             if (
@@ -186,12 +228,14 @@ def run_turn_pipeline(
                 and _detect_loop_or_stall(user_input, assistant_text, prior_turns)
             ):
                 anti_loop_nudged = True
+                _emit(event_cb, "ANTI-LOOP", "Detected permission stall or unverified offline claim; forcing direct tool execution.")
                 messages.append({"role": "assistant", "content": assistant_text})
                 messages.append({
                     "role": "user",
                     "content": (
-                        "[SYSTEM: ANTI-LOOP OVERRIDE — You repeated an earlier reply or asked permission without acting. "
-                        "Do NOT ask permission. Emit ONE `<rykr_cmd>`, `<rykr_read>`, or `<rykr_write>` tag right now "
+                        "[SYSTEM: ANTI-LOOP OVERRIDE — Do NOT ask permission or assume offline status without probing. "
+                        "Emit ONE `<rykr_cmd>`, `<rykr_read>`, or `<rykr_write>` tag right now "
+                        "(e.g., `curl -fsSL -m 10 <url>` or `rook_workbench.py --remember \"<fact>\"`) "
                         "to fulfill the Operator's request directly.]"
                     ),
                 })
@@ -234,6 +278,9 @@ def run_turn_pipeline(
     history_assistant = final_response + _compact_tool_history_tag(step_logs)
     ledger.append_turn("user", user_input, genesis_state=next_state, engine=active_engine)
     ledger.append_turn("assistant", history_assistant, genesis_state=next_state, engine=active_engine)
+
+    elapsed = time.monotonic() - turn_started
+    _emit(event_cb, "DONE", f"Turn complete in {elapsed:.1f}s ({tool_steps_executed} tool step(s))")
 
     return {
         "type": "LLM_TURN",

@@ -30,6 +30,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -78,7 +79,20 @@ class RookRuntimeState:
         self.staged_evidence_context: List[str] = []
         self.last_interaction = time.time()
         self.lock = threading.Lock()
+        self.activity_seq = 0
+        self.activity_log: deque = deque(maxlen=250)
+        self.activity_lock = threading.Lock()
         self.server_ref: Optional[ThreadingHTTPServer] = None
+
+    def emit_activity(self, tag: str, msg: str) -> None:
+        with self.activity_lock:
+            self.activity_seq += 1
+            self.activity_log.append({
+                "seq": self.activity_seq,
+                "ts": time.strftime("%H:%M:%S"),
+                "tag": str(tag),
+                "msg": str(msg),
+            })
 
     @property
     def active_workspace(self) -> str:
@@ -349,6 +363,53 @@ SINGLE_WINDOW_HTML = r"""<!DOCTYPE html>
     line-height: 1.45;
     font-size: 13px;
   }
+  /* LIVE TERMINAL & ACTUATOR FEED */
+  .term-feed {
+    background: #060606;
+    border-top: 2px solid var(--orange);
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
+  }
+  .term-bar {
+    background: #100902;
+    border-bottom: 1px solid var(--border);
+    padding: 4px 10px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 11px;
+    font-weight: 800;
+    color: var(--orange);
+  }
+  .term-bar .term-status {
+    font-size: 10px;
+    color: var(--muted);
+    margin-left: 8px;
+  }
+  .term-bar .term-status.busy {
+    color: var(--green);
+  }
+  .term-body {
+    height: 150px;
+    overflow-y: auto;
+    padding: 6px 10px;
+    font-size: 11.5px;
+    line-height: 1.38;
+    background: #030303;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .term-feed.collapsed .term-body { display: none; }
+  .term-line { margin-bottom: 2px; }
+  .term-ts { color: #666; margin-right: 6px; }
+  .term-tag { font-weight: 800; margin-right: 6px; }
+  .term-tag.ENGINE { color: var(--orange); }
+  .term-tag.CMD { color: #ffb300; }
+  .term-tag.STDOUT { color: #a7f3d0; }
+  .term-tag.WRITE, .term-tag.READ { color: #60a5fa; }
+  .term-tag.CMDOK, .term-tag.DONE { color: var(--green); }
+  .term-tag.CMDERR, .term-tag.TIMEOUT, .term-tag.ERROR, .term-tag.ANTI-LOOP, .term-tag.FIREWALL, .term-tag.LOCKED { color: var(--red); }
   /* INPUT COMPOSER */
   .composer {
     background: var(--panel);
@@ -510,6 +571,17 @@ SINGLE_WINDOW_HTML = r"""<!DOCTYPE html>
   <!-- CENTER PANE: CHAT STREAM + COMPOSER -->
   <div class="center-pane">
     <div id="chatStream" class="chat-stream"></div>
+
+    <div id="termFeed" class="term-feed">
+      <div class="term-bar">
+        <span>LIVE TERMINAL &amp; ACTUATOR FEED <span id="termStatus" class="term-status">IDLE</span></span>
+        <div style="display:flex;gap:6px;">
+          <button style="padding:1px 7px;font-size:10px;" id="btnToggleTerm" onclick="toggleTermFeed()">Hide</button>
+          <button style="padding:1px 7px;font-size:10px;" onclick="clearTermFeed()">Clear</button>
+        </div>
+      </div>
+      <div id="termBody" class="term-body"></div>
+    </div>
 
     <div class="composer">
       <div class="ingress-row">
@@ -764,6 +836,45 @@ async function unloadEngine() {
   refreshTelemetry();
 }
 
+let LAST_ACTIVITY_SEQ = 0;
+let TERM_POLL_TIMER = null;
+
+function toggleTermFeed() {
+  const feed = document.getElementById('termFeed');
+  const btn = document.getElementById('btnToggleTerm');
+  const collapsed = feed.classList.toggle('collapsed');
+  btn.innerText = collapsed ? 'Show' : 'Hide';
+}
+
+function clearTermFeed() {
+  document.getElementById('termBody').innerHTML = '';
+}
+
+async function pollActivity() {
+  try {
+    const res = await fetch('/api/activity?since=' + LAST_ACTIVITY_SEQ);
+    const data = await res.json();
+    const events = data.events || [];
+    if (events.length > 0) {
+      const body = document.getElementById('termBody');
+      events.forEach(ev => {
+        const line = document.createElement('div');
+        line.className = 'term-line';
+        const tagClass = String(ev.tag || '').replace(/[^A-Za-z0-9_-]/g, '');
+        line.innerHTML = `<span class="term-ts">[${escapeHtml(ev.ts)}]</span><span class="term-tag ${tagClass}">[${escapeHtml(ev.tag)}]</span><span>${escapeHtml(ev.msg)}</span>`;
+        body.appendChild(line);
+      });
+      while (body.children.length > 300) {
+        body.removeChild(body.firstChild);
+      }
+      body.scrollTop = body.scrollHeight;
+    }
+    if (typeof data.seq === 'number' && data.seq > LAST_ACTIVITY_SEQ) {
+      LAST_ACTIVITY_SEQ = data.seq;
+    }
+  } catch (e) {}
+}
+
 async function sendChatTurn() {
   const intent = document.getElementById('inpIntent').value.trim();
   const scope = document.getElementById('inpScope').value.trim();
@@ -779,8 +890,13 @@ async function sendChatTurn() {
   document.getElementById('inpContext').value = '';
 
   const btn = document.getElementById('btnSend');
+  const tStatus = document.getElementById('termStatus');
   btn.innerText = 'WORKING...';
   btn.disabled = true;
+  if (tStatus) { tStatus.innerText = 'LIVE'; tStatus.className = 'term-status busy'; }
+  await pollActivity();
+  if (TERM_POLL_TIMER) clearInterval(TERM_POLL_TIMER);
+  TERM_POLL_TIMER = setInterval(pollActivity, 500);
   try {
     const res = await fetch('/api/chat', {
       method: 'POST',
@@ -808,6 +924,9 @@ async function sendChatTurn() {
       appendCard('ROOK', `State: ${out.genesis_state} | Snap: ${out.snapshot_id || 'none'}`, out.response || JSON.stringify(out, null, 2), 'rook');
     }
   } finally {
+    if (TERM_POLL_TIMER) { clearInterval(TERM_POLL_TIMER); TERM_POLL_TIMER = null; }
+    await pollActivity();
+    if (tStatus) { tStatus.innerText = 'IDLE'; tStatus.className = 'term-status'; }
     btn.innerText = 'SEND TURN';
     btn.disabled = false;
     refreshTelemetry();
@@ -965,6 +1084,8 @@ window.addEventListener('DOMContentLoaded', async () => {
     });
   }
   setInterval(refreshTelemetry, 5000);
+  await pollActivity();
+  setInterval(pollActivity, 5000);
 });
 </script>
 </body>
@@ -1025,6 +1146,18 @@ class RookHTTPHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/history":
             turns, _ = RUNTIME.ledger.load_turns()
             self._send_json(200, {"turns": turns[-30:]})
+            return
+
+        if parsed.path == "/api/activity":
+            qs = parse_qs(parsed.query)
+            try:
+                since = int(qs.get("since", ["0"])[0])
+            except ValueError:
+                since = 0
+            with RUNTIME.activity_lock:
+                events = [e for e in RUNTIME.activity_log if e["seq"] > since]
+                seq = RUNTIME.activity_seq
+            self._send_json(200, {"seq": seq, "events": events})
             return
 
         if parsed.path == "/api/fs/browse":
@@ -1181,6 +1314,7 @@ class RookHTTPHandler(BaseHTTPRequestHandler):
                     ledger=RUNTIME.ledger,
                     engine_override="rook",
                     max_steps=MAX_TOOL_STEPS,
+                    event_cb=RUNTIME.emit_activity,
                 )
                 RUNTIME.last_interaction = time.time()
                 self._send_json(200, out)

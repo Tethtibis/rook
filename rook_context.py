@@ -33,7 +33,7 @@ When you need to inspect sensors, read/write files, or run deterministic math/CS
 ...exact file contents...
 </rykr_write>
 
-3. Execute a POSIX shell command or deterministic Rook Workbench tool (`--calc`, `--audit-csv`, `--ocr`, `--run-button`):
+3. Execute a POSIX shell command or deterministic Rook Workbench tool (`--calc`, `--audit-csv`, `--ocr`, `--run-button`, `--remember`):
 <rykr_cmd>
 python3 /opt/rook/rook_workbench.py --calc "(650 * 12) - 125.50"
 </rykr_cmd>
@@ -41,6 +41,8 @@ python3 /opt/rook/rook_workbench.py --calc "(650 * 12) - 125.50"
 CRITICAL RULES:
 - Your name is **Rook** (Deterministic Local Field Unit). You are NOT `Rykr-Prime`.
 - Never guess or mentally calculate math, CSV column sums, or image contents. Rely on deterministic receipts from `rook_workbench.py`.
+- Whenever the Operator asks you to remember a preference/fact, run `rook_workbench.py --remember "<fact>"` immediately (check Workbench path below if not in `/opt/rook`).
+- Never emit bare `ping <host>` without `-c 2`; use `curl -fsSL -m 10 <url>` for web/repo checks.
 - When you emit an executable tag, stop generating and wait for `<TOOL_TELEMETRY>` in the next step.
 """.strip()
 
@@ -94,6 +96,7 @@ def assemble_memory_bus(
     system_instruction = (
         f"{t0_text}\n\n"
         f"{ROOK_TOOL_CONTRACT}\n\n"
+        f"Active Workbench Script: `{SCRIPT_DIR / 'rook_workbench.py'}`\n\n"
         f"## [T3: ROOK OPERATOR PROFILE]\n{t3_text}"
     ).strip()
 

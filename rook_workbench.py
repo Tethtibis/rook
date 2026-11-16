@@ -46,6 +46,74 @@ INBOX_DIR = Path("/var/tmp/rook/inbox")
 BUTTONS_DIR = Path(os.path.expanduser("~/rook/buttons"))
 PRIME_INBOX_DIR = Path(os.path.expanduser("~/rook/prime_inbox"))
 SERVER_PRIME_INBOX = Path(os.path.expanduser(os.environ.get("ROOK_PRIME_INBOX", "~/rook/prime_inbox")))
+SCRIPT_DIR = Path(os.path.dirname(os.path.realpath(__file__)))
+
+
+def _resolve_operator_profile_path() -> Path:
+    env_path = os.environ.get("ROOK_OPERATOR_PROFILE", "").strip()
+    if env_path:
+        return Path(os.path.expanduser(env_path))
+    for cand in (SCRIPT_DIR / "ROOK_OPERATOR.md", Path("/opt/rook/ROOK_OPERATOR.md")):
+        if cand.is_file():
+            return cand
+    return SCRIPT_DIR / "ROOK_OPERATOR.md"
+
+
+def remember_operator_fact(fact: str) -> Dict[str, Any]:
+    """Appends a permanent learned fact into ROOK_OPERATOR.md (T3 memory)."""
+    clean_fact = " ".join((fact or "").strip().split())
+    if not clean_fact:
+        return {"status": "ERROR", "error": "Fact string cannot be empty."}
+
+    profile_path = _resolve_operator_profile_path()
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    if profile_path.is_file():
+        with open(profile_path, "r", encoding="utf-8", errors="replace") as f:
+            existing = f.read()
+    else:
+        existing = "# ROOK OPERATOR PROFILE\n\n## 3. LEARNED OPERATOR FACTS\n"
+
+    section_header = "## 3. LEARNED OPERATOR FACTS"
+    if section_header not in existing:
+        existing = existing.rstrip() + f"\n\n{section_header}\n"
+
+    lines = existing.splitlines()
+    norm_new = clean_fact.lower()
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("* "):
+            body = stripped[2:].strip()
+            if body.startswith("[") and "] " in body:
+                body = body.split("] ", 1)[1].strip()
+            if body.lower() == norm_new:
+                return {
+                    "status": "PROVEN",
+                    "action": "OPERATOR_FACT_ALREADY_PRESENT",
+                    "file": str(profile_path),
+                    "entry": stripped,
+                }
+
+    entry = f"* [{time.strftime('%Y-%m-%d')}] {clean_fact}"
+    hdr_idx = next(i for i, ln in enumerate(lines) if ln.strip() == section_header)
+    insert_idx = hdr_idx + 1
+    while insert_idx < len(lines) and not lines[insert_idx].strip().startswith("## "):
+        insert_idx += 1
+    while insert_idx > hdr_idx + 1 and not lines[insert_idx - 1].strip():
+        insert_idx -= 1
+    lines.insert(insert_idx, entry)
+
+    new_text = "\n".join(lines).rstrip() + "\n"
+    with open(profile_path, "w", encoding="utf-8") as f:
+        f.write(new_text)
+        f.flush()
+        os.fsync(f.fileno())
+
+    return {
+        "status": "PROVEN",
+        "action": "OPERATOR_FACT_SAVED",
+        "file": str(profile_path),
+        "entry": entry,
+    }
 
 
 def ensure_dirs() -> None:
@@ -370,6 +438,12 @@ BUILTIN_BUTTONS = [
         "description": "Checks WireGuard/LAN outpost reachability (configurable via ROOK_OUTPOST_IP).",
         "builtin": True,
     },
+    {
+        "id": "remember_fact",
+        "label": "Remember Operator Fact",
+        "description": "Saves a permanent fact or preference into Rook's Operator Profile (T3 memory).",
+        "builtin": True,
+    },
 ]
 
 
@@ -469,6 +543,9 @@ def execute_push_button(button_id: str, arg: str = "") -> Dict[str, Any]:
         except Exception as exc:
             return {"status": "ERROR", "error": str(exc)}
 
+    if button_id == "remember_fact":
+        return remember_operator_fact(arg)
+
     # Check custom forged buttons
     meta_file = BUTTONS_DIR / f"{button_id}.json"
     if meta_file.is_file():
@@ -516,8 +593,31 @@ def export_prime_audit(
         f"* **Compartment:** `{compartment}`",
         f"* **Operator Note / Request for Prime:** {operator_note or '(General session review & button harvesting)'}",
         "",
-        "## 1. Staged Evidence Files",
+        "## 0. Learned Operator Facts",
     ]
+    prof_path = _resolve_operator_profile_path()
+    learned_facts: List[str] = []
+    if prof_path.is_file():
+        with open(prof_path, "r", encoding="utf-8", errors="replace") as pf:
+            in_sec = False
+            for raw_ln in pf:
+                st_ln = raw_ln.strip()
+                if st_ln == "## 3. LEARNED OPERATOR FACTS":
+                    in_sec = True
+                    continue
+                if in_sec and st_ln.startswith("## "):
+                    break
+                if in_sec and st_ln.startswith("* "):
+                    learned_facts.append(st_ln)
+    if learned_facts:
+        lines.extend(learned_facts)
+    else:
+        lines.append("* *(None)*")
+
+    lines.extend([
+        "",
+        "## 1. Staged Evidence Files",
+    ])
     if evidence:
         for ev in evidence:
             lines.append(f"* `{ev['path']}` ({ev['size_bytes']} bytes, sha256:`{ev['sha256_short']}`)")
@@ -575,6 +675,7 @@ def main() -> int:
     parser.add_argument("--audit-csv", type=str, help="Run deterministic CSV column & SQLite audit")
     parser.add_argument("--sql", type=str, default=None, help="Optional SQL query against csv_data")
     parser.add_argument("--ocr", type=str, help="Run offline Tesseract OCR on an image")
+    parser.add_argument("--remember", type=str, help="Persist a durable Operator fact into ROOK_OPERATOR.md")
     parser.add_argument("--list-buttons", action="store_true", help="List available deterministic push-buttons")
     parser.add_argument("--run-button", type=str, help="Execute a push-button by ID")
     parser.add_argument("--arg", type=str, default="", help="Argument for --run-button")
@@ -588,6 +689,9 @@ def main() -> int:
         return 0
     if args.ocr:
         print(json.dumps(deterministic_ocr(args.ocr), indent=2))
+        return 0
+    if args.remember:
+        print(json.dumps(remember_operator_fact(args.remember), indent=2))
         return 0
     if args.list_buttons:
         print(json.dumps(list_push_buttons(), indent=2))

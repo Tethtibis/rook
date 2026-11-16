@@ -20,10 +20,13 @@ import hashlib
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
-from typing import List, Dict, Any, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 MAX_TOOL_STEPS = 3
 STATE_FILE = "/tmp/rook_engine_state.json"
@@ -201,12 +204,35 @@ def prompt_downshift_gate(call: Dict[str, Any], syntax_note: str = "") -> bool:
         return False
 
 
+def _emit(event_cb: Optional[Callable[[str, str], None]], tag: str, msg: str) -> None:
+    if event_cb is None:
+        return
+    try:
+        event_cb(tag, msg)
+    except Exception:
+        pass
+
+
+def _sanitize_hanging_commands(cmd_str: str) -> str:
+    """Prevents un-bounded commands like bare `ping <host>` from hanging until timeout."""
+    pattern = re.compile(r"(^|(?:&&|\|\||[;|])\s*)(ping6?)(\s+)([^;&|\n]+)")
+
+    def _repl(match: re.Match) -> str:
+        prefix, cmd_name, space, args = match.groups()
+        if re.search(r"(?:^|\s)-c(?:\s*\d+|\b)", args):
+            return match.group(0)
+        return f"{prefix}{cmd_name} -c 2 -W 2{space}{args}"
+
+    return pattern.sub(_repl, cmd_str)
+
+
 def execute_single_call(
     call: Dict[str, Any],
     workspace_root: str,
     timeout: int = 30,
     explicit_hemisphere: str = "",
     downshift_gate: bool = False,
+    event_cb: Optional[Callable[[str, str], None]] = None,
 ) -> Dict[str, Any]:
     tool = call["tool"]
     ws = Path(workspace_root).resolve()
@@ -216,13 +242,15 @@ def execute_single_call(
         target = Path(os.path.expanduser(call["path"]))
         if not target.is_absolute():
             target = (ws / target).resolve()
+        s = max(1, call.get("start", 1))
+        e = call.get("end", 80)
+        _emit(event_cb, "READ", f"{target} (lines {s}-{e})")
         if not target.is_file():
             return {"tool": "read", "status": "ERROR", "path": str(target), "output": f"File not found: {target}"}
         try:
             with open(target, "r", encoding="utf-8", errors="replace") as f:
                 lines = f.readlines()
-            s = max(1, call.get("start", 1))
-            e = min(len(lines), call.get("end", 80))
+            e = min(len(lines), e)
             snippet = "".join(f"{i}: {lines[i - 1]}" for i in range(s, e + 1))
             if len(snippet) > 2000:
                 snippet = snippet[:2000] + "\n...[TRUNCATED AT 2000 CHARS FOR LOCAL APU CONTEXT]..."
@@ -231,6 +259,7 @@ def execute_single_call(
             return {"tool": "read", "status": "ERROR", "path": str(target), "output": str(exc)}
 
     if locked and tool in ("write", "cmd"):
+        _emit(event_cb, "LOCKED", f"Hermetic read-only interlock blocked {tool}")
         return {
             "tool": tool,
             "status": "HERMETIC_READONLY_LOCK",
@@ -251,6 +280,7 @@ def execute_single_call(
 
         syntax_ok, syntax_msg = validate_syntax_firewall(target, content)
         if not syntax_ok:
+            _emit(event_cb, "FIREWALL", f"Blocked {target.name}: {syntax_msg}")
             return {
                 "tool": "write",
                 "status": "SYNTAX_FIREWALL_BLOCKED",
@@ -272,13 +302,15 @@ def execute_single_call(
                 f.write(content)
                 f.flush()
                 os.fsync(f.fileno())
+            nbytes = len(content.encode("utf-8"))
+            _emit(event_cb, "WRITE", f"{target} ({nbytes} bytes)")
             return {
                 "tool": "write",
                 "status": "SUCCESS",
                 "path": str(target),
                 "self_modified": ("/opt/rook" in str(target) or "rykr_harness" in str(target)),
                 "syntax_check": syntax_msg,
-                "bytes_written": len(content.encode("utf-8")),
+                "bytes_written": nbytes,
             }
         except Exception as exc:
             return {"tool": "write", "status": "ERROR", "path": str(target), "output": str(exc)}
@@ -292,29 +324,72 @@ def execute_single_call(
                 "reason": "Operator declined or deferred this command micro-step at the [y/N] confirmation gate.",
             }
 
-        cmd_str = call["command"]
+        cmd_str = _sanitize_hanging_commands(call["command"])
+        _emit(event_cb, "CMD", cmd_str)
+        started = time.monotonic()
+        collected: List[str] = []
+        streamed_lines = 0
+        proc: Optional[subprocess.Popen] = None
+
+        def _drain_stdout(pipe: Any) -> None:
+            nonlocal streamed_lines
+            try:
+                for raw_line in iter(pipe.readline, ""):
+                    collected.append(raw_line)
+                    clean = raw_line.rstrip("\r\n")
+                    if clean and streamed_lines < 120:
+                        streamed_lines += 1
+                        _emit(event_cb, "STDOUT", clean[:400])
+            finally:
+                try:
+                    pipe.close()
+                except Exception:
+                    pass
+
         try:
-            res = subprocess.run(
+            proc = subprocess.Popen(
                 cmd_str,
                 shell=True,
                 cwd=str(ws),
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
-                timeout=timeout,
+                bufsize=1,
+                start_new_session=True,
             )
-            combined = (res.stdout + ("\n" + res.stderr if res.stderr else "")).strip()
+            reader = threading.Thread(target=_drain_stdout, args=(proc.stdout,), daemon=True)
+            reader.start()
+            rc = proc.wait(timeout=timeout)
+            reader.join(timeout=2.0)
+            elapsed = time.monotonic() - started
+            _emit(event_cb, "CMD OK" if rc == 0 else "CMD ERR", f"exit={rc} ({elapsed:.2f}s)")
+            combined = "".join(collected).strip()
             if len(combined) > 2000:
                 combined = combined[:2000] + "\n...[TRUNCATED AT 2000 CHARS FOR LOCAL APU CONTEXT]..."
             return {
                 "tool": "cmd",
-                "status": "SUCCESS" if res.returncode == 0 else "NON_ZERO_EXIT",
-                "exit_code": res.returncode,
+                "status": "SUCCESS" if rc == 0 else "NON_ZERO_EXIT",
+                "exit_code": rc,
                 "command": cmd_str,
                 "output": combined,
             }
         except subprocess.TimeoutExpired:
-            return {"tool": "cmd", "status": "TIMEOUT", "command": cmd_str, "output": f"Timed out after {timeout}s"}
+            if proc is not None:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+            _emit(event_cb, "TIMEOUT", f"Timed out after {timeout}s")
+            partial = "".join(collected).strip()
+            msg = f"Timed out after {timeout}s"
+            if partial:
+                msg += "\nPartial output:\n" + partial[:1500]
+            return {"tool": "cmd", "status": "TIMEOUT", "command": cmd_str, "output": msg}
         except Exception as exc:
+            _emit(event_cb, "CMD ERR", str(exc))
             return {"tool": "cmd", "status": "ERROR", "command": cmd_str, "output": str(exc)}
 
     return {"tool": tool, "status": "ERROR", "output": f"Unknown tool: {tool}"}
@@ -327,6 +402,7 @@ def process_llm_response(
     timeout: int = 30,
     explicit_hemisphere: str = "",
     downshift_gate: bool = False,
+    event_cb: Optional[Callable[[str, str], None]] = None,
 ) -> Tuple[bool, List[Dict[str, Any]], str]:
     calls = extract_tool_calls(llm_output)
     if not calls:
@@ -348,6 +424,7 @@ def process_llm_response(
     for c in calls:
         sig = compute_call_signature(c)
         if sig in seen_signatures:
+            _emit(event_cb, "ANTI-LOOP", f"Blocked duplicate {c['tool']} call")
             results.append({
                 "tool": c["tool"],
                 "status": "CIRCUIT_BREAKER_TRIPPED",
@@ -362,6 +439,7 @@ def process_llm_response(
                 timeout=timeout,
                 explicit_hemisphere=explicit_hemisphere,
                 downshift_gate=downshift_gate,
+                event_cb=event_cb,
             )
         )
 
