@@ -112,22 +112,28 @@ def extract_tool_calls(llm_output: str) -> List[Dict[str, Any]]:
     """
     positioned_calls = []
 
-    # 1. <rykr_read path="..." [start="..."] [end="..."]/>
+    # 1. <rykr_read .../> (supports any attribute order & optional quotes)
     for m in re.finditer(
-        r"^[ \t]*<rykr_read\s+path=\"([^\"]+)\"(?:\s+start=\"(\d+)\")?(?:\s+end=\"(\d+)\")?\s*/?>",
+        r"^[ \t]*<rykr_read\s+([^>\n]+?)/?>",
         llm_output,
         re.MULTILINE,
     ):
+        attrs = m.group(1)
+        pm = re.search(r"path\s*=\s*[\"']([^\"']+)[\"']", attrs)
+        if not pm:
+            continue
+        sm = re.search(r"start\s*=\s*[\"']?(\d+)[\"']?", attrs)
+        em = re.search(r"end\s*=\s*[\"']?(\d+)[\"']?", attrs)
         positioned_calls.append((m.start(), {
             "tool": "read",
-            "path": m.group(1),
-            "start": int(m.group(2)) if m.group(2) else 1,
-            "end": int(m.group(3)) if m.group(3) else 250,
+            "path": pm.group(1),
+            "start": int(sm.group(1)) if sm else 1,
+            "end": int(em.group(1)) if em else 120,
         }))
 
     # 2. <rykr_write path="...">...</rykr_write>
     for m in re.finditer(
-        r"^[ \t]*<rykr_write\s+path=\"([^\"]+)\">\n?([\s\S]*?)\n?[ \t]*</rykr_write>",
+        r"^[ \t]*<rykr_write\s+path=[\"']([^\"']+)[\"']>\n?([\s\S]*?)\n?[ \t]*</rykr_write>",
         llm_output,
         re.MULTILINE,
     ):
@@ -137,12 +143,26 @@ def extract_tool_calls(llm_output: str) -> List[Dict[str, Any]]:
             "content": unwrap_inner_code_fence(m.group(2)),
         }))
 
-    # 3. <rykr_cmd>...</rykr_cmd> (also tolerates 3B ```rykr_cmd> ... ``` fence quirk)
+    # 3. <rykr_cmd>...</rykr_cmd> (separate from 3B ```rykr_cmd> ... ``` fence quirk so inner ```bash never truncates)
+    cmd_spans = []
     for m in re.finditer(
-        r"^[ \t]*(?:<rykr_cmd>|```rykr_cmd>?)\n?([\s\S]*?)\n?[ \t]*(?:</rykr_cmd>|```)",
+        r"^[ \t]*<rykr_cmd>\n?([\s\S]*?)\n?[ \t]*</rykr_cmd>",
         llm_output,
         re.MULTILINE,
     ):
+        cmd_spans.append((m.start(), m.end()))
+        positioned_calls.append((m.start(), {
+            "tool": "cmd",
+            "command": unwrap_inner_code_fence(m.group(1)).strip(),
+        }))
+
+    for m in re.finditer(
+        r"^[ \t]*```rykr_cmd>?\n?([\s\S]*?)\n?[ \t]*```",
+        llm_output,
+        re.MULTILINE,
+    ):
+        if any(s <= m.start() < e for s, e in cmd_spans):
+            continue
         positioned_calls.append((m.start(), {
             "tool": "cmd",
             "command": unwrap_inner_code_fence(m.group(1)).strip(),

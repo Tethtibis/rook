@@ -439,6 +439,13 @@ def execute_push_button(button_id: str, arg: str = "") -> Dict[str, Any]:
         return deterministic_ocr(target)
     if button_id == "gpu_vram_audit":
         try:
+            from rook_gguf_loader import probe_gpus
+            gpus = probe_gpus()
+            if gpus:
+                return {"status": "PROVEN", "engine": "Hardware GPU/APU Probe", "gpus": gpus}
+        except Exception:
+            pass
+        try:
             out = subprocess.check_output(
                 ["nvidia-smi", "--query-gpu=index,name,temperature.gpu,utilization.gpu,memory.used,memory.total", "--format=csv"],
                 text=True,

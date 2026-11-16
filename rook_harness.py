@@ -97,20 +97,27 @@ def run_turn_pipeline(
     final_response = ""
 
     is_local_brain = any(k in active_engine.lower() for k in ("rook", "ollama", "local", "openai"))
-    effective_max_mutations = 1 if is_local_brain else max_steps
+    max_total_steps = min(max_steps, 3) if is_local_brain else max_steps
+    max_mutations = 1 if is_local_brain else max_steps
 
     # 4. Module 4 & Module 5: Closed-Loop Inference + Actuator Cycle
     while True:
-        inf = dispatch_inference(
-            engine_spec=active_engine,
-            system_instruction=system_instruction,
-            messages=messages,
-            vault_path=vault_path,
-        )
+        try:
+            inf = dispatch_inference(
+                engine_spec=active_engine,
+                system_instruction=system_instruction,
+                messages=messages,
+                vault_path=vault_path,
+            )
+        except Exception as exc:
+            if step_logs:
+                final_response = f"[Engine interrupted after step {tool_steps_executed}: {exc}]"
+                break
+            raise
         assistant_text = enforce_rook_nomenclature(inf.get("response", ""))
         final_response = assistant_text
 
-        if mutation_steps_executed >= effective_max_mutations or read_steps_executed >= 3:
+        if tool_steps_executed >= max_total_steps:
             break
 
         has_calls, tool_results, telemetry_block = process_llm_response(
@@ -129,16 +136,30 @@ def run_turn_pipeline(
             read_steps_executed += 1
 
         step_logs.append({"step": tool_steps_executed, "results": tool_results})
-        if mutation_steps_executed >= effective_max_mutations:
+        if tool_steps_executed >= max_total_steps or mutation_steps_executed >= max_mutations:
             telemetry_block += (
-                "\n[SYSTEM: 1-STEP MICRO-BYTE COMPLETE. Summarize the result above in plain text "
-                "for the Operator. Do NOT emit another XML tool tag until the Operator's next turn.]"
+                "\n\n[SYSTEM: Tool execution complete. Directly answer the Operator's latest message in plain text "
+                "using the telemetry above. Do NOT emit any <rykr_read>, <rykr_write>, or <rykr_cmd> tags.]"
+            )
+        else:
+            telemetry_block += (
+                "\n\n[SYSTEM: If you have all facts needed to answer the Operator's latest message, reply directly "
+                "in plain text. Only emit another tool tag if essential information is still missing.]"
             )
         messages.append({"role": "assistant", "content": assistant_text})
         messages.append({"role": "user", "content": telemetry_block})
 
         if any(r.get("status") in ("CIRCUIT_BREAKER_TRIPPED", "HERMETIC_READONLY_LOCK", "SYNTAX_FIREWALL_BLOCKED", "OPERATOR_DEFERRED_MICROSTEP") for r in tool_results):
             break
+
+        if mutation_steps_executed >= max_mutations:
+            max_total_steps = tool_steps_executed
+
+    if step_logs:
+        cleaned_summary = re.sub(r"<rykr_(?:write|cmd|read)[\s\S]*?(?:</rykr_(?:write|cmd|read)>|/>)", "", final_response)
+        cleaned_summary = re.sub(r"\[?<?TOOL_TELEMETRY>?\]?[\s\S]*?\[?</?TOOL_TELEMETRY>?\]?", "", cleaned_summary).strip()
+        if cleaned_summary:
+            final_response = cleaned_summary
 
     # 5. Persist completed turn to fault-tolerant JSONL ledger
     ledger.append_turn("user", user_input, genesis_state=next_state, engine=active_engine)

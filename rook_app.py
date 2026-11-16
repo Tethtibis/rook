@@ -784,6 +784,16 @@ async function sendChatTurn() {
     const out = await res.json();
     if (out.error) {
       appendCard('ROOK ERROR', 'Engine Notice', out.error, 'user');
+    } else if (out.type === 'HARNESS_COMMAND') {
+      if (out.action === 'ROLLBACK') {
+        const hRes = await fetch('/api/history');
+        const hist = await hRes.json();
+        document.getElementById('chatStream').innerHTML = '';
+        (hist.turns || []).forEach(t => {
+          appendCard(t.role === 'user' ? 'OPERATOR' : 'ROOK', t.timestamp || '', t.content, t.role === 'user' ? 'user' : '');
+        });
+      }
+      appendCard('ROOK HARNESS', out.action || 'COMMAND', JSON.stringify(out, null, 2), 'receipt');
     } else {
       if (out.tool_logs && out.tool_logs.length > 0) {
         appendCard('MODULE 5 (ACTUATOR)', `Executed ${out.tool_steps_executed} Deterministic Step(s)`, JSON.stringify(out.tool_logs, null, 2), 'receipt');
@@ -1061,9 +1071,13 @@ class RookHTTPHandler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/api/chat/clear":
-            turns_file = Path(RUNTIME.state_dir) / "session_turns.jsonl"
-            if turns_file.is_file():
-                turns_file.unlink()
+            for p in (
+                RUNTIME.ledger.ledger_path,
+                RUNTIME.ledger.meta_path,
+                Path(RUNTIME.state_dir) / "session_turns.jsonl",
+            ):
+                if p.is_file():
+                    p.unlink()
             RUNTIME.staged_evidence_context.clear()
             self._send_json(200, {"status": "cleared"})
             return
@@ -1178,10 +1192,29 @@ def launch_desktop_window(url: str) -> Optional[subprocess.Popen]:
             env["DISPLAY"] = ":0"
         else:
             return None
+    if env.get("DISPLAY") and not env.get("XAUTHORITY"):
+        home_xauth = os.path.expanduser("~/.Xauthority")
+        if os.path.isfile(home_xauth):
+            env["XAUTHORITY"] = home_xauth
     for browser in ("chromium", "chromium-browser", "google-chrome", "brave-browser", "microsoft-edge"):
         bpath = shutil.which(browser)
         if bpath:
             profile_dir = "/tmp/rook_app_window_profile"
+            lock_path = os.path.join(profile_dir, "SingletonLock")
+            if os.path.islink(lock_path):
+                try:
+                    target = os.readlink(lock_path)
+                    pid_str = target.rsplit("-", 1)[-1]
+                    if pid_str.isdigit():
+                        try:
+                            os.kill(int(pid_str), 0)
+                        except ProcessLookupError:
+                            for fname in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+                                fp = os.path.join(profile_dir, fname)
+                                if os.path.lexists(fp):
+                                    os.unlink(fp)
+                except OSError:
+                    pass
             return subprocess.Popen(
                 [
                     bpath,
@@ -1225,14 +1258,6 @@ def main() -> int:
     )
 
     st = RUNTIME.engine_mgr.get_state_metadata()
-    if st and st.get("model_path") and not RUNTIME.engine_mgr.is_online():
-        mpath = st["model_path"]
-        if os.path.isfile(mpath):
-            try:
-                print(f"[*] Restoring active GGUF brain into VRAM: {os.path.basename(mpath)}...")
-                RUNTIME.engine_mgr.load(model_path=mpath, force_hemisphere=st.get("hemisphere"))
-            except Exception as exc:
-                print(f"[!] Auto-restore warning: {exc}")
 
     atexit.register(RUNTIME.shutdown_everything)
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
@@ -1240,19 +1265,42 @@ def main() -> int:
 
     threading.Thread(target=_idle_vram_watchdog, args=(RUNTIME,), daemon=True).start()
 
-    server = ThreadingHTTPServer((args.host, args.port), RookHTTPHandler)
+    local_url = f"http://127.0.0.1:{args.port}"
+    try:
+        server = ThreadingHTTPServer((args.host, args.port), RookHTTPHandler)
+    except OSError as exc:
+        if getattr(exc, "errno", None) == 98:
+            print(f"[*] Port {args.port} already active; opening Rook window to {local_url}")
+            if not args.no_window:
+                win_proc = launch_desktop_window(local_url)
+                if win_proc is not None:
+                    win_proc.wait()
+            return 0
+        raise
     RUNTIME.server_ref = server
 
-    local_url = f"http://127.0.0.1:{args.port}"
+    if st and st.get("model_path") and not RUNTIME.engine_mgr.is_online():
+        mpath = st["model_path"]
+        if os.path.isfile(mpath):
+            def _bg_restore(mp: str, hemi: Optional[str]):
+                try:
+                    print(f"[*] Restoring active GGUF brain into VRAM: {os.path.basename(mp)}...")
+                    RUNTIME.engine_mgr.load(model_path=mp, force_hemisphere=hemi)
+                except Exception as exc:
+                    print(f"[!] Auto-restore warning: {exc}")
+            threading.Thread(target=_bg_restore, args=(mpath, st.get("hemisphere")), daemon=True).start()
+
     print(f"[+] ROOK Single-Window Appliance listening at {local_url}")
     print("[+] Closing the program or clicking [QUIT & FREE VRAM] immediately releases 100% of GPU VRAM.")
 
     win_proc = None if args.no_window else launch_desktop_window(local_url)
     if win_proc is not None:
-        def _watch_window(p: subprocess.Popen, rt: RookRuntimeState):
+        t_launch = time.time()
+        def _watch_window(p: subprocess.Popen, rt: RookRuntimeState, launched_at: float):
             p.wait()
-            rt.shutdown_everything()
-        threading.Thread(target=_watch_window, args=(win_proc, RUNTIME), daemon=True).start()
+            if (time.time() - launched_at) >= 2.5:
+                rt.shutdown_everything()
+        threading.Thread(target=_watch_window, args=(win_proc, RUNTIME, t_launch), daemon=True).start()
 
     try:
         server.serve_forever()
