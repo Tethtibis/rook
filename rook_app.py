@@ -414,6 +414,7 @@ SINGLE_WINDOW_HTML = r"""<!DOCTYPE html>
   }
   .file-item:hover { background: #1f0d00; border-color: var(--orange); }
 </style>
+<style id="rookLiveTheme"></style>
 </head>
 <body>
 
@@ -692,6 +693,11 @@ async function refreshTelemetry() {
         evList.appendChild(d);
       });
     }
+
+    const themeEl = document.getElementById('rookLiveTheme');
+    if (themeEl && typeof data.theme_css === 'string' && themeEl.textContent !== data.theme_css) {
+      themeEl.textContent = data.theme_css;
+    }
   } catch (e) {
     console.error(e);
   }
@@ -790,7 +796,8 @@ async function sendChatTurn() {
         const hist = await hRes.json();
         document.getElementById('chatStream').innerHTML = '';
         (hist.turns || []).forEach(t => {
-          appendCard(t.role === 'user' ? 'OPERATOR' : 'ROOK', t.timestamp || '', t.content, t.role === 'user' ? 'user' : '');
+          const clean = String(t.content || '').replace(/\n\[tools_executed:[^\]]*\]$/, '');
+          appendCard(t.role === 'user' ? 'OPERATOR' : 'ROOK', t.timestamp || '', clean, t.role === 'user' ? 'user' : 'rook');
         });
       }
       appendCard('ROOK HARNESS', out.action || 'COMMAND', JSON.stringify(out, null, 2), 'receipt');
@@ -798,7 +805,7 @@ async function sendChatTurn() {
       if (out.tool_logs && out.tool_logs.length > 0) {
         appendCard('MODULE 5 (ACTUATOR)', `Executed ${out.tool_steps_executed} Deterministic Step(s)`, JSON.stringify(out.tool_logs, null, 2), 'receipt');
       }
-      appendCard('ROOK', `State: ${out.genesis_state} | Snap: ${out.snapshot_id || 'none'}`, out.response || JSON.stringify(out, null, 2), '');
+      appendCard('ROOK', `State: ${out.genesis_state} | Snap: ${out.snapshot_id || 'none'}`, out.response || JSON.stringify(out, null, 2), 'rook');
     }
   } finally {
     btn.innerText = 'SEND TURN';
@@ -953,7 +960,8 @@ window.addEventListener('DOMContentLoaded', async () => {
       'receipt');
   } else {
     hist.turns.forEach(t => {
-      appendCard(t.role === 'user' ? 'OPERATOR' : 'ROOK', t.timestamp || '', t.content, t.role === 'user' ? 'user' : '');
+      const clean = String(t.content || '').replace(/\n\[tools_executed:[^\]]*\]$/, '');
+      appendCard(t.role === 'user' ? 'OPERATOR' : 'ROOK', t.timestamp || '', clean, t.role === 'user' ? 'user' : 'rook');
     });
   }
   setInterval(refreshTelemetry, 5000);
@@ -994,6 +1002,13 @@ class RookHTTPHandler(BaseHTTPRequestHandler):
             gpus = probe_gpus()
             models = scan_models_dir(RUNTIME.models_dir)
             snap = render_snap_summary(RUNTIME.ledger, tail_count=1)
+            theme_css = ""
+            theme_path = Path(SCRIPT_DIR) / "rook_theme.css"
+            if theme_path.is_file():
+                try:
+                    theme_css = theme_path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    pass
             self._send_json(200, {
                 "engine_online": online is not None,
                 "active_worker": online,
@@ -1003,6 +1018,7 @@ class RookHTTPHandler(BaseHTTPRequestHandler):
                 "genesis_state": snap["active_genesis_state"],
                 "push_buttons": list_push_buttons(),
                 "evidence_tray": list_evidence_tray(),
+                "theme_css": theme_css,
             })
             return
 
@@ -1155,14 +1171,18 @@ class RookHTTPHandler(BaseHTTPRequestHandler):
                 prompt_with_evidence = prompt
 
             try:
-                from rook_harness import run_turn_pipeline
-                out = run_turn_pipeline(
+                import importlib
+                import rook_harness, rook_context, rook_actuator, rook_workbench, rook_governor, rook_engine
+                for mod in (rook_governor, rook_context, rook_actuator, rook_workbench, rook_engine, rook_harness):
+                    importlib.reload(mod)
+                out = rook_harness.run_turn_pipeline(
                     user_input=prompt_with_evidence,
                     workspace_dir=RUNTIME.active_workspace,
                     ledger=RUNTIME.ledger,
                     engine_override="rook",
                     max_steps=MAX_TOOL_STEPS,
                 )
+                RUNTIME.last_interaction = time.time()
                 self._send_json(200, out)
             except Exception as exc:
                 self._send_json(500, {"error": str(exc)})

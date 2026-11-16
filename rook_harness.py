@@ -40,6 +40,57 @@ def enforce_rook_nomenclature(text: str) -> str:
     return out
 
 
+def _compact_tool_history_tag(step_logs: list) -> str:
+    """Produces a compact 1-line trailing summary of executed tools for JSONL history memory."""
+    parts = []
+    for step in step_logs:
+        for r in step.get("results", []):
+            t = r.get("tool", "?")
+            st = r.get("status", "?")
+            if t == "cmd":
+                cmd_short = (r.get("command") or "").replace("\n", " ")[:70]
+                parts.append(f"cmd(`{cmd_short}`) -> {st}(rc={r.get('exit_code', '?')})")
+            elif t == "write":
+                parts.append(f"write({r.get('path')}) -> {st}")
+            elif t == "read":
+                parts.append(f"read({r.get('path')}) -> {st}")
+            else:
+                parts.append(f"{t} -> {st}")
+    if not parts:
+        return ""
+    return "\n[tools_executed: " + "; ".join(parts) + "]"
+
+
+def _detect_loop_or_stall(user_input: str, assistant_text: str, prior_turns: list) -> bool:
+    """Detects when a local model stalls asking permission or repeats a prior assistant response."""
+    low_resp = assistant_text.lower()
+    low_user = user_input.lower().strip()
+    recent_assistant = [
+        (t.get("content") or "").split("\n[tools_executed:")[0].strip()
+        for t in prior_turns[-6:]
+        if t.get("role") == "assistant"
+    ]
+    norm_resp = re.sub(r"^\[PARSED INTENT:[^\]]*\]\s*", "", assistant_text.strip(), flags=re.IGNORECASE).strip()
+    for prev in recent_assistant[-2:]:
+        norm_prev = re.sub(r"^\[PARSED INTENT:[^\]]*\]\s*", "", prev.strip(), flags=re.IGNORECASE).strip()
+        if len(norm_resp) > 30 and norm_prev == norm_resp:
+            return True
+
+    asking_perm = any(p in low_resp for p in (
+        "would you like me to continue",
+        "would you like me to proceed",
+        "would you like me to install",
+        "shall i proceed",
+        "do you want me to proceed",
+        "do you want me to continue",
+    ))
+    affirmative_or_action = (
+        low_user in ("yes", "yes please", "yes please continue", "please do", "continue", "go ahead", "do it", "proceed")
+        or any(w in low_user for w in ("install", "change", "modify", "find", "check", "fix", "create", "update"))
+    )
+    return bool(asking_perm and affirmative_or_action)
+
+
 def run_turn_pipeline(
     user_input: str,
     workspace_dir: str,
@@ -99,6 +150,7 @@ def run_turn_pipeline(
     is_local_brain = any(k in active_engine.lower() for k in ("rook", "ollama", "local", "openai"))
     max_total_steps = min(max_steps, 3) if is_local_brain else max_steps
     max_mutations = 1 if is_local_brain else max_steps
+    anti_loop_nudged = False
 
     # 4. Module 4 & Module 5: Closed-Loop Inference + Actuator Cycle
     while True:
@@ -127,6 +179,23 @@ def run_turn_pipeline(
             downshift_gate=is_local_brain,
         )
         if not has_calls:
+            if (
+                is_local_brain
+                and tool_steps_executed == 0
+                and not anti_loop_nudged
+                and _detect_loop_or_stall(user_input, assistant_text, prior_turns)
+            ):
+                anti_loop_nudged = True
+                messages.append({"role": "assistant", "content": assistant_text})
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "[SYSTEM: ANTI-LOOP OVERRIDE — You repeated an earlier reply or asked permission without acting. "
+                        "Do NOT ask permission. Emit ONE `<rykr_cmd>`, `<rykr_read>`, or `<rykr_write>` tag right now "
+                        "to fulfill the Operator's request directly.]"
+                    ),
+                })
+                continue
             break
 
         tool_steps_executed += 1
@@ -162,8 +231,9 @@ def run_turn_pipeline(
             final_response = cleaned_summary
 
     # 5. Persist completed turn to fault-tolerant JSONL ledger
+    history_assistant = final_response + _compact_tool_history_tag(step_logs)
     ledger.append_turn("user", user_input, genesis_state=next_state, engine=active_engine)
-    ledger.append_turn("assistant", final_response, genesis_state=next_state, engine=active_engine)
+    ledger.append_turn("assistant", history_assistant, genesis_state=next_state, engine=active_engine)
 
     return {
         "type": "LLM_TURN",
