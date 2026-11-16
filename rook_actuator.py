@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ==============================================================================
-RYKR / OBRYN ACTUATOR (MODULE 5): DUAL-HEMISPHERE INTERLOCK, SYNTAX FIREWALL,
+ROOK ACTUATOR (MODULE 5): DUAL-HEMISPHERE INTERLOCK, SYNTAX FIREWALL,
 14B FENCE-TOLERANT XML PARSER, & MICRO-STEP DOWNSHIFT GOVERNOR
 ==============================================================================
 Fixes the "Rook Passive Chatbot Bug":
@@ -348,7 +348,7 @@ def process_llm_response(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Rykr/Obryn Actuator (Module 5): Dual-Hemisphere & 14B Downshift Governor")
+    parser = argparse.ArgumentParser(description="Rook Actuator (Module 5): Dual-Hemisphere & 14B Downshift Governor")
     parser.add_argument("--workspace", default="~/rook", help="Workspace root directory")
     parser.add_argument("--hemisphere", default="", help="Optional explicit hemisphere override (HERMETIC or BUILDER)")
     parser.add_argument("--downshift", action="store_true", help="Enable 14B Downshift Gate & 1-step cap")

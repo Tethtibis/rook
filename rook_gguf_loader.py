@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ==============================================================================
-OBRYN MODULE 0: STANDALONE VULKAN/CUDA GGUF LOADER & UNIFIED MEMORY MANAGER
+ROOK MODULE 0: STANDALONE VULKAN/CUDA GGUF LOADER & UNIFIED MEMORY MANAGER
 ==============================================================================
 Manages direct, zero-daemon native `llama-server` child processes on AMD RDNA3
 Unified Memory APUs (Vulkan) or NVIDIA GPUs (CUDA), bound to parent lifecycle
@@ -202,7 +202,7 @@ def recommend_gpus_for_model(model_size_gb: float, gpus: List[Dict[str, Any]]) -
     return sorted(selected)
 
 
-class ObrynEngineManager:
+class RookEngineManager:
     """
     Manages the lifecycle of the single `llama-server` child process.
     Guarantees that unloading or closing the parent program immediately kills
@@ -397,12 +397,8 @@ class ObrynEngineManager:
         raise TimeoutError(f"Timed out waiting {wait_timeout}s for GGUF model to load into Unified Memory.")
 
 
-# Backward-compatible alias for shared modules
-RookEngineManager = ObrynEngineManager
-
-
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Obryn Module 0: Standalone Vulkan/CUDA GGUF Engine Loader")
+    parser = argparse.ArgumentParser(description="Rook Module 0: Standalone Vulkan/CUDA GGUF Engine Loader")
     parser.add_argument("--no-pdeath", action="store_true", help="Allow worker to survive CLI parent exit")
     parser.add_argument("--status", action="store_true", help="Report GPU/APU + Engine status + available GGUF models")
     parser.add_argument("--load", "--model", dest="load", type=str, metavar="GGUF_PATH", help="Load a .gguf file into Unified Memory")
@@ -414,7 +410,7 @@ def main() -> int:
     parser.add_argument("--models-dir", type=str, default=DEFAULT_MODELS_DIR, help="Directory to scan for .gguf files")
     args = parser.parse_args()
 
-    mgr = ObrynEngineManager(port=args.port)
+    mgr = RookEngineManager(port=args.port)
 
     if args.unload:
         res = mgr.unload()

@@ -1172,17 +1172,38 @@ def launch_desktop_window(url: str) -> Optional[subprocess.Popen]:
     display is active. When the user closes that window, the parent process detects
     window exit and immediately unloads VRAM.
     """
-    if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
-        return None
+    env = os.environ.copy()
+    if not env.get("DISPLAY") and not env.get("WAYLAND_DISPLAY"):
+        if os.path.exists("/tmp/.X11-unix/X0"):
+            env["DISPLAY"] = ":0"
+        else:
+            return None
     for browser in ("chromium", "chromium-browser", "google-chrome", "brave-browser", "microsoft-edge"):
         bpath = shutil.which(browser)
         if bpath:
             profile_dir = "/tmp/rook_app_window_profile"
             return subprocess.Popen(
-                [bpath, f"--app={url}", f"--user-data-dir={profile_dir}", "--window-size=1440,900"],
+                [
+                    bpath,
+                    f"--app={url}",
+                    f"--user-data-dir={profile_dir}",
+                    "--window-size=1440,900",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--password-store=basic",
+                    "--disable-features=Translate",
+                ],
+                env=env,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+    if shutil.which("xdg-open"):
+        return subprocess.Popen(
+            ["xdg-open", url],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
     return None
 
 
@@ -1202,6 +1223,16 @@ def main() -> int:
         workspace_work=os.path.abspath(os.path.expanduser(args.work_dir)),
         models_dir=args.models_dir,
     )
+
+    st = RUNTIME.engine_mgr.get_state_metadata()
+    if st and st.get("model_path") and not RUNTIME.engine_mgr.is_online():
+        mpath = st["model_path"]
+        if os.path.isfile(mpath):
+            try:
+                print(f"[*] Restoring active GGUF brain into VRAM: {os.path.basename(mpath)}...")
+                RUNTIME.engine_mgr.load(model_path=mpath, force_hemisphere=st.get("hemisphere"))
+            except Exception as exc:
+                print(f"[!] Auto-restore warning: {exc}")
 
     atexit.register(RUNTIME.shutdown_everything)
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
