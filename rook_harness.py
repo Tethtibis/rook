@@ -91,10 +91,15 @@ def run_turn_pipeline(
     system_instruction = bus["system_instruction"]
     seen_tool_signatures = set()
     tool_steps_executed = 0
+    mutation_steps_executed = 0
+    read_steps_executed = 0
     step_logs = []
     final_response = ""
 
-    # 4. Module 4 & Module 5: Closed-Loop Inference + Actuator Cycle (capped at max_steps)
+    is_local_brain = any(k in active_engine.lower() for k in ("rook", "ollama", "local", "openai"))
+    effective_max_mutations = 1 if is_local_brain else max_steps
+
+    # 4. Module 4 & Module 5: Closed-Loop Inference + Actuator Cycle
     while True:
         inf = dispatch_inference(
             engine_spec=active_engine,
@@ -105,23 +110,34 @@ def run_turn_pipeline(
         assistant_text = enforce_rook_nomenclature(inf.get("response", ""))
         final_response = assistant_text
 
-        if tool_steps_executed >= max_steps:
+        if mutation_steps_executed >= effective_max_mutations or read_steps_executed >= 3:
             break
 
         has_calls, tool_results, telemetry_block = process_llm_response(
             llm_output=assistant_text,
             workspace_root=workspace_dir,
             seen_signatures=seen_tool_signatures,
+            downshift_gate=is_local_brain,
         )
         if not has_calls:
             break
 
         tool_steps_executed += 1
+        if any(r.get("tool") in ("write", "cmd") for r in tool_results):
+            mutation_steps_executed += 1
+        else:
+            read_steps_executed += 1
+
         step_logs.append({"step": tool_steps_executed, "results": tool_results})
+        if mutation_steps_executed >= effective_max_mutations:
+            telemetry_block += (
+                "\n[SYSTEM: 1-STEP MICRO-BYTE COMPLETE. Summarize the result above in plain text "
+                "for the Operator. Do NOT emit another XML tool tag until the Operator's next turn.]"
+            )
         messages.append({"role": "assistant", "content": assistant_text})
         messages.append({"role": "user", "content": telemetry_block})
 
-        if any(r.get("status") == "CIRCUIT_BREAKER_TRIPPED" for r in tool_results):
+        if any(r.get("status") in ("CIRCUIT_BREAKER_TRIPPED", "HERMETIC_READONLY_LOCK", "SYNTAX_FIREWALL_BLOCKED", "OPERATOR_DEFERRED_MICROSTEP") for r in tool_results):
             break
 
     # 5. Persist completed turn to fault-tolerant JSONL ledger

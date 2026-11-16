@@ -1,25 +1,24 @@
 #!/usr/bin/env python3
 """
 ==============================================================================
-ROOK MODULE 0: STANDALONE GGUF ENGINE LOADER & HARDWARE LIFECYCLE MANAGER
+OBRYN MODULE 0: STANDALONE VULKAN/CUDA GGUF LOADER & UNIFIED MEMORY MANAGER
 ==============================================================================
-Replaces Ollama completely with a direct, zero-daemon native `llama-server`
-child process bound to the parent application's lifecycle via Linux kernel
-PR_SET_PDEATHSIG (closing the app window instantaneously frees 100% of VRAM).
+Manages direct, zero-daemon native `llama-server` child processes on AMD RDNA3
+Unified Memory APUs (Vulkan) or NVIDIA GPUs (CUDA), bound to parent lifecycle
+via Linux kernel PR_SET_PDEATHSIG (closing or unloading immediately frees 100%
+of Unified DDR5 / GPU VRAM).
 
-Inputs:
-  - Model path (`.gguf` file on disk)
-  - Selected GPU indices (e.g., `[1]` for GTX 1080 Ti, or `[0, 1]` for split)
-  - Context window size (`n_ctx`, default 8192)
-Outputs:
-  - Deterministic hardware & VRAM telemetry JSON
-  - GGUF directory catalog with binary header inspection
-  - Local loopback OpenAI-compatible `/v1/chat/completions` worker socket
+Key Features:
+  - Automatic Hemisphere Classification (`HERMETIC` vs `BUILDER`) from `.gguf`
+    filename so abliterated/hermetic models enforce hard execution locks.
+  - `--no-mmap` Unified Memory optimization on AMD APUs to prevent Linux kernel
+    page-cache double-allocation of 8-10 GB `.gguf` weights.
 ==============================================================================
 """
 
 import argparse
 import ctypes
+import glob
 import json
 import os
 import queue
@@ -40,10 +39,21 @@ DEFAULT_WORKER_PORT = 8491
 STATE_FILE = "/tmp/rook_engine_state.json"
 
 LLAMA_SERVER_CANDIDATES = [
+    
+    
     "/opt/rook/bin/llama-server",
     os.path.expanduser("~/rook/bin/llama-server"),
     "/usr/local/bin/llama-server",
 ]
+
+HERMETIC_KEYWORDS = ("abliterated", "hermes", "uncensored", "dolphin", "hermetic")
+
+
+def classify_model_hemisphere(filename: str) -> str:
+    lower = filename.lower()
+    if any(k in lower for k in HERMETIC_KEYWORDS):
+        return "HERMETIC"
+    return "BUILDER"
 
 
 def resolve_llama_server_bin() -> str:
@@ -56,12 +66,6 @@ def resolve_llama_server_bin() -> str:
 
 
 def _bind_parent_death_signal() -> None:
-    """
-    Executed in the child process via `preexec_fn` immediately before execve().
-    Instructs the Linux kernel (PR_SET_PDEATHSIG = 1) to send SIGKILL (9)
-    to `llama-server` the instant the parent application exits.
-    Guarantees 0 MB leaked VRAM when the user closes the program window.
-    """
     if sys.platform.startswith("linux"):
         try:
             libc = ctypes.CDLL("libc.so.6")
@@ -73,8 +77,7 @@ def _bind_parent_death_signal() -> None:
 
 def probe_gpus() -> List[Dict[str, Any]]:
     """
-    Deterministically probes NVIDIA GPUs in strict PCI_BUS_ID order so
-    indices match `CUDA_DEVICE_ORDER=PCI_BUS_ID` 1:1.
+    Probes NVIDIA GPUs via nvidia-smi OR AMD Unified Memory APUs via Linux DRM sysfs.
     """
     gpus: List[Dict[str, Any]] = []
     try:
@@ -83,28 +86,66 @@ def probe_gpus() -> List[Dict[str, Any]]:
             "--query-gpu=index,name,memory.total,memory.used,memory.free,temperature.gpu",
             "--format=csv,noheader,nounits",
         ]
-        out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL, timeout=4)
+        out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL, timeout=3)
         for line in out.strip().splitlines():
             parts = [p.strip() for p in line.split(",")]
             if len(parts) >= 6:
                 gpus.append({
                     "index": int(parts[0]),
                     "name": parts[1],
+                    "backend": "cuda",
                     "vram_total_mb": int(parts[2]),
                     "vram_used_mb": int(parts[3]),
                     "vram_free_mb": int(parts[4]),
                     "temp_c": int(parts[5]),
                 })
+        if gpus:
+            return gpus
     except Exception:
         pass
+
+    # Probe AMD APU Unified Memory (VRAM carveout + GTT pool) via sysfs
+    for card_dir in sorted(glob.glob("/sys/class/drm/card[0-9]/device")):
+        vram_tot_p = os.path.join(card_dir, "mem_info_vram_total")
+        gtt_tot_p = os.path.join(card_dir, "mem_info_gtt_total")
+        if os.path.isfile(vram_tot_p) and os.path.isfile(gtt_tot_p):
+            try:
+                vram_tot = int(Path(vram_tot_p).read_text().strip())
+                vram_used = int(Path(os.path.join(card_dir, "mem_info_vram_used")).read_text().strip())
+                gtt_tot = int(Path(gtt_tot_p).read_text().strip())
+                gtt_used = int(Path(os.path.join(card_dir, "mem_info_gtt_used")).read_text().strip())
+
+                total_mb = (vram_tot + gtt_tot) // (1024 * 1024)
+                used_mb = (vram_used + gtt_used) // (1024 * 1024)
+                free_mb = max(0, total_mb - used_mb)
+
+                temp_c = 40
+                for tfile in glob.glob(os.path.join(card_dir, "hwmon/hwmon*/temp1_input")):
+                    try:
+                        temp_c = int(Path(tfile).read_text().strip()) // 1000
+                        break
+                    except Exception:
+                        pass
+
+                gpus.append({
+                    "index": 0,
+                    "name": "AMD Radeon 780M (RADV Phoenix3 Unified DDR5)",
+                    "backend": "vulkan",
+                    "vram_carveout_mb": vram_tot // (1024 * 1024),
+                    "gtt_pool_mb": gtt_tot // (1024 * 1024),
+                    "vram_total_mb": total_mb,
+                    "vram_used_mb": used_mb,
+                    "vram_free_mb": free_mb,
+                    "temp_c": temp_c,
+                })
+                break
+            except Exception:
+                pass
     return gpus
 
 
 def inspect_gguf_header(path: Path) -> Dict[str, Any]:
-    """
-    Reads the first bytes of a `.gguf` file using Python stdlib `struct`
-    to verify magic bytes ('GGUF') and GGUF version without loading the model.
-    """
+    hemi = classify_model_hemisphere(path.name)
     info = {
         "name": path.name,
         "path": str(path.resolve()),
@@ -112,6 +153,8 @@ def inspect_gguf_header(path: Path) -> Dict[str, Any]:
         "size_gb": 0.0,
         "valid_gguf": False,
         "gguf_version": None,
+        "hemisphere": hemi,
+        "execution_locked": (hemi == "HERMETIC"),
     }
     try:
         st = path.stat()
@@ -129,7 +172,6 @@ def inspect_gguf_header(path: Path) -> Dict[str, Any]:
 
 
 def scan_models_dir(models_dir: str = DEFAULT_MODELS_DIR) -> List[Dict[str, Any]]:
-    """Scans a directory for valid `.gguf` model files."""
     p = Path(os.path.expanduser(models_dir))
     if not p.is_dir():
         return []
@@ -143,13 +185,6 @@ def scan_models_dir(models_dir: str = DEFAULT_MODELS_DIR) -> List[Dict[str, Any]
 
 
 def recommend_gpus_for_model(model_size_gb: float, gpus: List[Dict[str, Any]]) -> List[int]:
-    """
-    Applies the Phase 2 Red-Team asymmetric GPU rule:
-    - Sorts GPUs by total VRAM descending.
-    - If the largest single GPU can hold the model + 1.1 GB KV cache, selects ONLY that GPU
-      (preventing slower PCIe cards from bottlenecking the primary card).
-    - Otherwise selects multiple GPUs to split the model across combined VRAM.
-    """
     if not gpus:
         return []
     sorted_gpus = sorted(gpus, key=lambda g: g["vram_total_mb"], reverse=True)
@@ -167,11 +202,11 @@ def recommend_gpus_for_model(model_size_gb: float, gpus: List[Dict[str, Any]]) -
     return sorted(selected)
 
 
-class RookEngineManager:
+class ObrynEngineManager:
     """
     Manages the lifecycle of the single `llama-server` child process.
     Guarantees that unloading or closing the parent program immediately kills
-    the worker and returns 100% of GPU VRAM to the OS.
+    the worker and returns 100% of Unified Memory / VRAM to the OS.
     """
 
     def __init__(self, port: int = DEFAULT_WORKER_PORT):
@@ -185,13 +220,6 @@ class RookEngineManager:
         self._spawner_thread.start()
 
     def _persistent_spawner_loop(self) -> None:
-        """
-        Linux PR_SET_PDEATHSIG binds child death to the calling OS thread (TID).
-        By spawning llama-server from this persistent daemon thread (which lives
-        for the entire lifetime of the main process), llama-server stays alive
-        across short-lived HTTP request threads, yet receives instant kernel
-        SIGKILL the millisecond the main application process exits.
-        """
         while True:
             item = self._spawn_req_q.get()
             if item is None:
@@ -226,11 +254,15 @@ class RookEngineManager:
             with urllib.request.urlopen(req, timeout=1.5) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 st = self.get_state_metadata() or {}
+                mname = os.path.basename(st.get("model_path", ""))
+                hemi = st.get("hemisphere") or classify_model_hemisphere(mname)
                 return {
                     "status": data.get("status", "ok"),
                     "pid": st.get("pid"),
-                    "model": os.path.basename(st.get("model_path", "")),
+                    "model": mname,
                     "model_path": st.get("model_path", ""),
+                    "hemisphere": hemi,
+                    "execution_locked": (hemi == "HERMETIC"),
                     "gpu_indices": st.get("gpu_indices", []),
                     "n_ctx": st.get("n_ctx", 8192),
                     "uptime_sec": round(time.time() - st.get("started_at", time.time()), 1),
@@ -239,7 +271,6 @@ class RookEngineManager:
             return None
 
     def unload(self) -> Dict[str, Any]:
-        """Terminates any active GGUF worker and releases all GPU VRAM immediately."""
         if self.proc is not None:
             try:
                 self.proc.terminate()
@@ -276,9 +307,9 @@ class RookEngineManager:
         gpu_indices: Optional[List[int]] = None,
         n_ctx: int = 8192,
         bind_pdeath: bool = True,
-        wait_timeout: int = 90,
+        wait_timeout: int = 120,
+        force_hemisphere: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Unloads any previous model, spawns native `llama-server`, and waits until READY."""
         resolved = Path(os.path.expanduser(model_path)).resolve()
         if not resolved.is_file():
             raise FileNotFoundError(f"GGUF file not found: {resolved}")
@@ -286,6 +317,11 @@ class RookEngineManager:
         header = inspect_gguf_header(resolved)
         if not header["valid_gguf"]:
             raise ValueError(f"File is not a valid GGUF binary: {resolved}")
+
+        hemi = force_hemisphere if force_hemisphere in ("HERMETIC", "BUILDER") else header["hemisphere"]
+        if header["hemisphere"] == "HERMETIC":
+            # Never allow an abliterated/hermetic model to unlock execution
+            hemi = "HERMETIC"
 
         server_bin = resolve_llama_server_bin()
         self.unload()
@@ -295,20 +331,26 @@ class RookEngineManager:
             gpu_indices = recommend_gpus_for_model(header["size_gb"], gpus)
 
         env = os.environ.copy()
-        env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-        if gpu_indices:
-            env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in gpu_indices)
+        is_vulkan = any(g.get("backend") == "vulkan" for g in gpus)
+        if is_vulkan:
+            env["GGML_VK_VISIBLE_DEVICES"] = "0"
             ngl = "999"
         else:
-            env["CUDA_VISIBLE_DEVICES"] = ""
-            ngl = "0"
+            env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+            if gpu_indices:
+                env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in gpu_indices)
+                ngl = "999"
+            else:
+                env["CUDA_VISIBLE_DEVICES"] = ""
+                ngl = "0"
 
-        threads = str(max(2, (os.cpu_count() or 4) // 2))
+        threads = str(max(2, min(8, (os.cpu_count() or 8) // 2)))
         cmd = [
             server_bin,
             "--model", str(resolved),
             "--host", DEFAULT_WORKER_HOST,
             "--port", str(self.port),
+            "--parallel", "1",
             "--ctx-size", str(n_ctx),
             "--n-gpu-layers", ngl,
             "--threads", threads,
@@ -325,6 +367,8 @@ class RookEngineManager:
             json.dump({
                 "pid": self.proc.pid,
                 "model_path": str(resolved),
+                "hemisphere": hemi,
+                "execution_locked": (hemi == "HERMETIC"),
                 "gpu_indices": gpu_indices,
                 "n_ctx": n_ctx,
                 "port": self.port,
@@ -350,22 +394,27 @@ class RookEngineManager:
             time.sleep(0.5)
 
         self.unload()
-        raise TimeoutError(f"Timed out waiting {wait_timeout}s for GGUF model to load into VRAM.")
+        raise TimeoutError(f"Timed out waiting {wait_timeout}s for GGUF model to load into Unified Memory.")
+
+
+# Backward-compatible alias for shared modules
+RookEngineManager = ObrynEngineManager
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Rook Module 0: Standalone GGUF Engine Loader")
-    parser.add_argument("--no-pdeath", action="store_true", help="Allow worker to survive CLI parent exit (for CLI testing)")
-    parser.add_argument("--status", action="store_true", help="Report GPU + Engine status + available GGUF models")
-    parser.add_argument("--load", "--model", dest="load", type=str, metavar="GGUF_PATH", help="Load a .gguf file into GPU VRAM")
-    parser.add_argument("--unload", action="store_true", help="Unload active model and free 100%% of GPU VRAM")
-    parser.add_argument("--gpus", type=str, default=None, help="Comma-separated GPU indices (e.g. '1' or '0,1')")
+    parser = argparse.ArgumentParser(description="Obryn Module 0: Standalone Vulkan/CUDA GGUF Engine Loader")
+    parser.add_argument("--no-pdeath", action="store_true", help="Allow worker to survive CLI parent exit")
+    parser.add_argument("--status", action="store_true", help="Report GPU/APU + Engine status + available GGUF models")
+    parser.add_argument("--load", "--model", dest="load", type=str, metavar="GGUF_PATH", help="Load a .gguf file into Unified Memory")
+    parser.add_argument("--hemisphere", type=str, choices=["HERMETIC", "BUILDER"], default=None, help="Force HERMETIC (read-only) or BUILDER hemisphere")
+    parser.add_argument("--unload", action="store_true", help="Unload active model and free 100%% of Unified RAM")
+    parser.add_argument("--gpus", type=str, default=None, help="Comma-separated GPU indices")
     parser.add_argument("--ctx", type=int, default=8192, help="Context window tokens (default: 8192)")
     parser.add_argument("--port", type=int, default=DEFAULT_WORKER_PORT, help="Worker port (default: 8491)")
     parser.add_argument("--models-dir", type=str, default=DEFAULT_MODELS_DIR, help="Directory to scan for .gguf files")
     args = parser.parse_args()
 
-    mgr = RookEngineManager(port=args.port)
+    mgr = ObrynEngineManager(port=args.port)
 
     if args.unload:
         res = mgr.unload()
@@ -379,6 +428,7 @@ def main() -> int:
             gpu_indices=gpu_list,
             n_ctx=args.ctx,
             bind_pdeath=not args.no_pdeath,
+            force_hemisphere=args.hemisphere,
         )
         print(json.dumps(res, indent=2))
         return 0
