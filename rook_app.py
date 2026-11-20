@@ -73,6 +73,7 @@ class RookRuntimeState:
         self.models_dir = os.path.expanduser(models_dir)
         self.compartment = "Home"  # "Home" or "Work"
         self.engine_mgr = RookEngineManager(port=8491)
+        self.remote_engine: Optional[str] = None  # e.g., "gemini" when using a cloud API brain
         self.state_dir = os.path.expanduser("~/.local/share/rook/state")
         self.snap_dir = os.path.expanduser("~/.local/share/rook/snapshots")
         self.ledger = HarnessLedger(state_dir=self.state_dir, snap_dir=self.snap_dir)
@@ -1121,7 +1122,20 @@ class RookHTTPHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/status":
             online = RUNTIME.engine_mgr.is_online()
             gpus = probe_gpus()
-            models = scan_models_dir(RUNTIME.models_dir)
+            models = list(scan_models_dir(RUNTIME.models_dir))
+            models.append({
+                "name": "Gemini Frontier API (Cloud)",
+                "path": "remote:gemini",
+                "size_gb": 0.0,
+                "hemisphere": "BUILDER",
+            })
+            active_worker = online
+            if active_worker is None and RUNTIME.remote_engine:
+                active_worker = {
+                    "model": f"{RUNTIME.remote_engine.upper()} REMOTE BRAIN",
+                    "model_path": f"remote:{RUNTIME.remote_engine}",
+                    "hemisphere": "BUILDER",
+                }
             snap = render_snap_summary(RUNTIME.ledger, tail_count=1)
             theme_css = ""
             theme_path = Path(SCRIPT_DIR) / "rook_theme.css"
@@ -1131,8 +1145,8 @@ class RookHTTPHandler(BaseHTTPRequestHandler):
                 except OSError:
                     pass
             self._send_json(200, {
-                "engine_online": online is not None,
-                "active_worker": online,
+                "engine_online": active_worker is not None,
+                "active_worker": active_worker,
                 "gpus": gpus,
                 "available_models": models,
                 "compartment": RUNTIME.compartment,
@@ -1202,6 +1216,19 @@ class RookHTTPHandler(BaseHTTPRequestHandler):
             model_path = req.get("model_path", "")
             gpu_indices = req.get("gpu_indices")
             try:
+                if model_path.startswith("remote:"):
+                    target_remote = model_path.split(":", 1)[1].strip().lower()
+                    RUNTIME.engine_mgr.unload()
+                    RUNTIME.remote_engine = target_remote
+                    RUNTIME.emit_activity("ENGINE", f"Switched to {target_remote.upper()} remote brain (0 MB local VRAM used).")
+                    self._send_json(200, {
+                        "status": "online",
+                        "model": f"{target_remote.upper()} REMOTE BRAIN",
+                        "model_path": model_path,
+                        "hemisphere": "BUILDER",
+                    })
+                    return
+                RUNTIME.remote_engine = None
                 res = RUNTIME.engine_mgr.load(model_path=model_path, gpu_indices=gpu_indices, bind_pdeath=True)
                 self._send_json(200, res)
             except Exception as exc:
@@ -1209,6 +1236,7 @@ class RookHTTPHandler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/api/engine/unload":
+            RUNTIME.remote_engine = None
             res = RUNTIME.engine_mgr.unload()
             self._send_json(200, res)
             return
@@ -1284,10 +1312,16 @@ class RookHTTPHandler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "Empty prompt"})
                 return
 
+            if prompt.lower() == "~gemini":
+                RUNTIME.engine_mgr.unload()
+                RUNTIME.remote_engine = "gemini"
+                self._send_json(200, {"type": "HARNESS_COMMAND", "action": "SWITCH_ENGINE", "engine": "gemini", "response": "Switched to Gemini Frontier API (BUILDER ARMED). Local VRAM freed."})
+                return
+
             online = RUNTIME.engine_mgr.is_online()
-            if not online and not prompt.startswith("~"):
+            if not online and not RUNTIME.remote_engine and not prompt.startswith("~"):
                 self._send_json(400, {
-                    "error": "No GGUF engine is currently loaded in VRAM. Select a .gguf model in the Top Bar and click [LOAD ENGINE] first."
+                    "error": "No engine is currently active. Select a local .gguf model or Gemini Frontier API in the Top Bar and click [LOAD ENGINE] first."
                 })
                 return
 
@@ -1308,11 +1342,12 @@ class RookHTTPHandler(BaseHTTPRequestHandler):
                 import rook_harness, rook_context, rook_actuator, rook_workbench, rook_governor, rook_engine
                 for mod in (rook_governor, rook_context, rook_actuator, rook_workbench, rook_engine, rook_harness):
                     importlib.reload(mod)
+                active_eng = RUNTIME.remote_engine or "rook"
                 out = rook_harness.run_turn_pipeline(
                     user_input=prompt_with_evidence,
                     workspace_dir=RUNTIME.active_workspace,
                     ledger=RUNTIME.ledger,
-                    engine_override="rook",
+                    engine_override=active_eng,
                     max_steps=MAX_TOOL_STEPS,
                     event_cb=RUNTIME.emit_activity,
                 )

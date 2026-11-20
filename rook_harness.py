@@ -73,9 +73,14 @@ def _emit(event_cb: Optional[Callable[[str, str], None]], tag: str, msg: str) ->
 
 
 def _detect_loop_or_stall(user_input: str, assistant_text: str, prior_turns: list) -> bool:
-    """Detects permission stalls, repeated replies, or unverified offline claims on network requests."""
+    """Detects permission stalls, repeated replies, hallucinated tool claims, or unverified offline claims."""
     low_resp = assistant_text.lower()
     low_user = user_input.lower().strip()
+
+    # 0. Direct hallucination of harness tool tags / telemetry with zero real tool calls
+    if "[tools_executed:" in low_resp or "<tool_telemetry>" in low_resp or "[actuator execution receipt]" in low_resp:
+        return True
+
     recent_assistant = [
         (t.get("content") or "").split("\n[tools_executed:")[0].strip()
         for t in prior_turns[-6:]
@@ -100,13 +105,21 @@ def _detect_loop_or_stall(user_input: str, assistant_text: str, prior_turns: lis
         "do you want me to continue",
         "let me know if you'd like me to",
         "please confirm if you want",
+        "i will now create",
+        "i will now write",
+        "i will now run",
+        "i will now execute",
+        "i will now perform",
+        "i will now proceed to",
+        "i have successfully created",
+        "i have successfully written",
     ))
     affirmative_or_action = (
-        low_user in ("yes", "yes please", "yes please continue", "please do", "continue", "go ahead", "do it", "proceed")
+        low_user in (".", "yes", "yes please", "yes please continue", "please do", "continue", "go ahead", "do it", "proceed")
         or any(w in low_user for w in (
             "install", "change", "modify", "find", "check", "fix", "create", "update",
             "figure out", "why", "how", "what", "test", "try", "remember", "save",
-            "internet", "inspect", "read", "write", "run",
+            "internet", "inspect", "read", "write", "run", "proceed", "script", "file",
         ))
     )
     if asking_perm and affirmative_or_action:
@@ -228,13 +241,15 @@ def run_turn_pipeline(
                 and _detect_loop_or_stall(user_input, assistant_text, prior_turns)
             ):
                 anti_loop_nudged = True
-                _emit(event_cb, "ANTI-LOOP", "Detected permission stall or unverified offline claim; forcing direct tool execution.")
-                messages.append({"role": "assistant", "content": assistant_text})
+                _emit(event_cb, "ANTI-LOOP", "Detected stall or fake tool claim (0 tools ran); forcing direct XML tool execution.")
+                clean_attempt = re.sub(r"\n?\[tools_executed:[^\]]*\]", "", assistant_text).strip()
+                messages.append({"role": "assistant", "content": clean_attempt})
                 messages.append({
                     "role": "user",
                     "content": (
-                        "[SYSTEM: ANTI-LOOP OVERRIDE — Do NOT ask permission or assume offline status without probing. "
-                        "Emit ONE `<rykr_cmd>`, `<rykr_read>`, or `<rykr_write>` tag right now "
+                        "[SYSTEM: ACTUATOR ANTI-HALLUCINATION OVERRIDE — ZERO tools executed on your last reply. "
+                        "NEVER type `[tools_executed: ...]` or narrate an action without emitting a real XML tag. "
+                        "Emit ONE real `<rykr_cmd>`, `<rykr_read>`, or `<rykr_write>` tag right now "
                         "(e.g., `curl -fsSL -m 10 <url>` or `rook_workbench.py --remember \"<fact>\"`) "
                         "to fulfill the Operator's request directly.]"
                     ),
@@ -268,13 +283,15 @@ def run_turn_pipeline(
         if mutation_steps_executed >= max_mutations:
             max_total_steps = tool_steps_executed
 
+    # Always strip any model-hallucinated [tools_executed: ...] or <TOOL_TELEMETRY> before saving or returning
+    final_response = re.sub(r"\n?\[tools_executed:[^\]]*\]", "", final_response)
+    final_response = re.sub(r"\[?<?TOOL_TELEMETRY>?\]?[\s\S]*?\[?</?TOOL_TELEMETRY>?\]?", "", final_response).strip()
     if step_logs:
-        cleaned_summary = re.sub(r"<rykr_(?:write|cmd|read)[\s\S]*?(?:</rykr_(?:write|cmd|read)>|/>)", "", final_response)
-        cleaned_summary = re.sub(r"\[?<?TOOL_TELEMETRY>?\]?[\s\S]*?\[?</?TOOL_TELEMETRY>?\]?", "", cleaned_summary).strip()
+        cleaned_summary = re.sub(r"<rykr_(?:write|cmd|read)[\s\S]*?(?:</rykr_(?:write|cmd|read)>|/>)", "", final_response).strip()
         if cleaned_summary:
             final_response = cleaned_summary
 
-    # 5. Persist completed turn to fault-tolerant JSONL ledger
+    # 5. Persist completed turn to fault-tolerant JSONL ledger (rook_context.py strips [tools_executed:] before LLM history)
     history_assistant = final_response + _compact_tool_history_tag(step_logs)
     ledger.append_turn("user", user_input, genesis_state=next_state, engine=active_engine)
     ledger.append_turn("assistant", history_assistant, genesis_state=next_state, engine=active_engine)

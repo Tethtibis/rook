@@ -15,6 +15,7 @@ Responsibilities:
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import List, Dict, Any
@@ -43,6 +44,7 @@ CRITICAL RULES:
 - Never guess or mentally calculate math, CSV column sums, or image contents. Rely on deterministic receipts from `rook_workbench.py`.
 - Whenever the Operator asks you to remember a preference/fact, run `rook_workbench.py --remember "<fact>"` immediately (check Workbench path below if not in `/opt/rook`).
 - Never emit bare `ping <host>` without `-c 2`; use `curl -fsSL -m 10 <url>` for web/repo checks.
+- NEVER fabricate or type `[tools_executed: ...]` or `<TOOL_TELEMETRY>` yourself. The ONLY way an action runs is by emitting a real `<rykr_cmd>`, `<rykr_read>`, or `<rykr_write>` XML tag.
 - When you emit an executable tag, stop generating and wait for `<TOOL_TELEMETRY>` in the next step.
 """.strip()
 
@@ -106,12 +108,19 @@ def assemble_memory_bus(
     selected_turns = []
     accumulated_tokens = 0
     for t in reversed(turns):
-        t_tokens = estimate_tokens(t.get("content", ""))
+        raw_content = t.get("content", "")
+        role = "assistant" if t.get("role") == "assistant" else "user"
+        if role == "assistant":
+            # Strip audit-only [tools_executed: ...] trailers so local models never imitate them instead of emitting XML tags
+            raw_content = re.sub(r"\n?\[tools_executed:[^\]]*\]", "", raw_content).strip()
+        if not raw_content:
+            continue
+        t_tokens = estimate_tokens(raw_content)
         if accumulated_tokens + t_tokens > history_budget and selected_turns:
             break
         selected_turns.append({
-            "role": "assistant" if t.get("role") == "assistant" else "user",
-            "content": t.get("content", ""),
+            "role": role,
+            "content": raw_content,
         })
         accumulated_tokens += t_tokens
 
